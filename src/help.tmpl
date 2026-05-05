@@ -14,13 +14,15 @@ Keybindings for task report:
 
     {{add}}: task add {string}                 - Add new task
 
+    A: task add {string} + Linear              - Add new task and sync to Linear
+
     {{done}}: task {selected} done              - Mark task as done
+
+    p: task {selected} start                   - Mark task as In Progress (syncs to Linear)
 
     {{edit}}: task {selected} edit              - Open selected task in editor
 
-    {{duplicate}}: task {selected} duplicate         - Duplicate tasks
-
-    {{down}}: {selected+=1}                     - Move down in task report
+{{down}}: {selected+=1}                     - Move down in task report
 
     {{up}}: {selected-=1}                     - Move up in task report
 
@@ -39,6 +41,12 @@ Keybindings for task report:
     {{quit}}: exit                              - Quit
 
     {{start_stop}}: task {selected} start/stop        - Toggle start and stop
+
+    Ctrl-a: linear-sync push-task {selected}   - Push existing task to Linear
+
+    D: edit Linear issue description           - Open $EDITOR for multi-line Linear description
+
+    C: post Linear comment                     - Open $EDITOR to write a multi-line Linear comment
 
     {{quick_tag}}: task {selected} +{tag}/-{tag}     - Toggle {uda.taskwarrior-tui.quick-tag.name} (default: `next`)
 

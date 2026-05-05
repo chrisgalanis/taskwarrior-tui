@@ -3,6 +3,7 @@ pub enum Action {
   Report,
   Filter,
   Add,
+  AddLinear,
   Annotate,
   Subprocess,
   Log,

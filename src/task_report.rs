@@ -3,7 +3,7 @@ use std::{error::Error, process::Command};
 use anyhow::Result;
 use chrono::{Datelike, Local, NaiveDateTime};
 use itertools::join;
-use task_hookrs::{task::Task, uda::UDAValue};
+use task_hookrs::{status::TaskStatus, task::Task, uda::UDAValue};
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
@@ -310,6 +310,19 @@ impl TaskReportTable {
   pub fn get_string_attribute(&self, attribute: &str, task: &Task, tasks: &[Task]) -> String {
     let description = utils::display_control_chars(task.description());
 
+    let status_badge = if task.start().is_some() {
+      "[in progress] "
+    } else if task.status() == &TaskStatus::Pending {
+      "[pending] "
+    } else {
+      ""
+    };
+
+    let linear_prefix = match task.uda().get("linearidentifier") {
+      Some(UDAValue::Str(s)) if !s.is_empty() => format!("[{}] {}", s, status_badge),
+      _ => status_badge.to_string(),
+    };
+
     let value = match attribute {
       "id" => task.id().unwrap_or_default().to_string(),
       "scheduled.relative" => match task.scheduled() {
@@ -459,7 +472,7 @@ impl TaskReportTable {
         } else {
           Default::default()
         };
-        format!("{} {}", description.clone(), c)
+        format!("{}{} {}", linear_prefix, description.clone(), c)
       }
       "description.truncated_count" => {
         let c = if let Some(a) = task.annotations() {
@@ -469,27 +482,31 @@ impl TaskReportTable {
         };
         let d = description.to_string();
         let mut available_width = self.description_width;
-        if self.description_width >= c.len() {
-          available_width = self.description_width - c.len();
+        let overhead = c.len() + linear_prefix.width();
+        if self.description_width >= overhead {
+          available_width = self.description_width - overhead;
         }
         let (d, _) = d.unicode_truncate(available_width);
         let mut d = d.to_string();
         if d != description {
           d = format!("{}\u{2026}", d);
         }
-        format!("{}{}", d, c)
+        format!("{}{}{}", linear_prefix, d, c)
       }
       "description.truncated" => {
         let d = description.to_string();
-        let available_width = self.description_width;
+        let mut available_width = self.description_width;
+        if linear_prefix.width() < available_width {
+          available_width = self.description_width - linear_prefix.width();
+        }
         let (d, _) = d.unicode_truncate(available_width);
         let mut d = d.to_string();
         if d != description {
           d = format!("{}\u{2026}", d);
         }
-        d
+        format!("{}{}", linear_prefix, d)
       }
-      "description.desc" | "description" => description.clone(),
+      "description.desc" | "description" => format!("{}{}", linear_prefix, description),
       "urgency" => match &task.urgency() {
         Some(f) => format!("{:.2}", *f),
         None => "0.00".to_string(),

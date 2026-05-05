@@ -27,7 +27,7 @@ use ratatui::{
   style::{Color, Modifier, Style},
   symbols::bar::FULL,
   text::{Line, Span, Text},
-  widgets::{Block, BorderType, Borders, Clear, Gauge, LineGauge, List, ListItem, Paragraph, Tabs, Wrap},
+  widgets::{Block, BorderType, Borders, Clear, Gauge, LineGauge, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use regex::Regex;
 use rustyline::{At, Editor, Word, history::SearchDirection as HistoryDirection, line_buffer::LineBuffer};
@@ -132,7 +132,54 @@ pub enum Mode {
   Tasks(Action),
   Projects,
   Timesheet,
+  Completed,
   Calendar,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletedFilter {
+  All,
+  LastWeek,
+  LastTwoWeeks,
+  LastMonth,
+  LastThreeMonths,
+  LastYear,
+}
+
+impl CompletedFilter {
+  pub fn label(&self) -> &'static str {
+    match self {
+      Self::All => "All",
+      Self::LastWeek => "Last Week",
+      Self::LastTwoWeeks => "Last 2 Weeks",
+      Self::LastMonth => "Last Month",
+      Self::LastThreeMonths => "Last 3 Months",
+      Self::LastYear => "Last Year",
+    }
+  }
+
+  pub fn next(&self) -> Self {
+    match self {
+      Self::All => Self::LastWeek,
+      Self::LastWeek => Self::LastTwoWeeks,
+      Self::LastTwoWeeks => Self::LastMonth,
+      Self::LastMonth => Self::LastThreeMonths,
+      Self::LastThreeMonths => Self::LastYear,
+      Self::LastYear => Self::All,
+    }
+  }
+
+  pub fn cutoff(&self) -> Option<chrono::DateTime<Local>> {
+    let now = Local::now();
+    match self {
+      Self::All => None,
+      Self::LastWeek => Some(now - chrono::Duration::weeks(1)),
+      Self::LastTwoWeeks => Some(now - chrono::Duration::weeks(2)),
+      Self::LastMonth => Some(now - chrono::Duration::days(30)),
+      Self::LastThreeMonths => Some(now - chrono::Duration::days(90)),
+      Self::LastYear => Some(now - chrono::Duration::days(365)),
+    }
+  }
 }
 
 pub struct TaskwarriorTui {
@@ -187,6 +234,11 @@ pub struct TaskwarriorTui {
   pub timesheet_data: String,
   pub timesheet_scroll: u16,
   pub timesheet_line_count: u16,
+  pub completed_tasks: Vec<Task>,
+  pub completed_selected: usize,
+  pub completed_filter: CompletedFilter,
+  pub completed_list_state: ListState,
+  pub completed_detail_scroll: u16,
 }
 
 impl TaskwarriorTui {
@@ -284,6 +336,11 @@ impl TaskwarriorTui {
       timesheet_data: String::new(),
       timesheet_scroll: 0,
       timesheet_line_count: 0,
+      completed_tasks: vec![],
+      completed_selected: 0,
+      completed_filter: CompletedFilter::All,
+      completed_list_state: ListState::default(),
+      completed_detail_scroll: 0,
     };
 
     for c in app.config.filter.chars() {
@@ -416,7 +473,7 @@ impl TaskwarriorTui {
     }
 
     match self.mode {
-      Mode::Tasks(Action::Add | Action::Annotate | Action::Log) => {
+      Mode::Tasks(Action::Add | Action::AddLinear | Action::Annotate | Action::Log) => {
         self.command_history.reset();
         Self::insert_text(&mut self.command, text, &mut self.changes);
         self.update_input_for_completion();
@@ -489,18 +546,20 @@ impl TaskwarriorTui {
       Mode::Tasks(action) => self.draw_task(f, main_layout, action),
       Mode::Projects => self.draw_projects(f, main_layout),
       Mode::Timesheet => self.draw_timesheet(f, main_layout),
+      Mode::Completed => self.draw_completed(f, main_layout),
       Mode::Calendar => self.draw_calendar(f, main_layout),
     }
   }
 
   fn draw_tabs(&self, f: &mut Frame, layout: Rect) {
-    let titles: Vec<&str> = vec!["Tasks", "Projects", "Timesheet", "Calendar"];
+    let titles: Vec<&str> = vec!["Tasks", "Projects", "Timesheet", "Completed", "Calendar"];
     let tab_names: Vec<_> = titles.into_iter().map(Line::from).collect();
     let selected_tab = match self.mode {
       Mode::Tasks(_) => 0,
       Mode::Projects => 1,
       Mode::Timesheet => 2,
-      Mode::Calendar => 3,
+      Mode::Completed => 3,
+      Mode::Calendar => 4,
     };
     let navbar_block = Block::default().style(self.config.uda_style_navbar);
     let context = Line::from(vec![
@@ -642,6 +701,123 @@ impl TaskwarriorTui {
   pub fn draw_timesheet(&mut self, f: &mut Frame, rect: Rect) {
     let p = Paragraph::new(Text::from(self.styled_timesheet_lines())).scroll((self.timesheet_scroll, 0));
     f.render_widget(p, rect);
+  }
+
+  pub fn update_completed_tasks(&mut self) -> Result<()> {
+    let output = std::process::Command::new(&self.task_exe)
+      .arg("rc.json.array=on")
+      .arg("rc.color=off")
+      .arg("rc._forcecolor=off")
+      .arg("status:completed")
+      .arg("export")
+      .output()
+      .context("Unable to run `task status:completed export`")?;
+
+    if output.status.success() {
+      let data = String::from_utf8_lossy(&output.stdout);
+      if let Ok(mut tasks) = import(data.as_bytes()) {
+        tasks.retain(|t| matches!(t.status(), TaskStatus::Completed));
+        tasks.sort_by(|a, b| {
+          let da = a.end().map(|d| **d);
+          let db = b.end().map(|d| **d);
+          db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.completed_tasks = tasks;
+        if self.completed_selected >= self.completed_tasks.len() {
+          self.completed_selected = self.completed_tasks.len().saturating_sub(1);
+        }
+      }
+    }
+    Ok(())
+  }
+
+  pub fn completed_visible_tasks(&self) -> Vec<&Task> {
+    match self.completed_filter.cutoff() {
+      None => self.completed_tasks.iter().collect(),
+      Some(cutoff) => self
+        .completed_tasks
+        .iter()
+        .filter(|t| {
+          t.end()
+            .map(|d| crate::datetime::local_from_utc(d) >= cutoff)
+            .unwrap_or(false)
+        })
+        .collect(),
+    }
+  }
+
+  pub fn draw_completed(&mut self, f: &mut Frame, rect: Rect) {
+    let chunks = Layout::default()
+      .direction(Direction::Horizontal)
+      .constraints([Constraint::Percentage(40), Constraint::Percentage(60)].as_ref())
+      .split(rect);
+
+    let style_completed = self.config.color.get("color.completed").copied().unwrap_or_default();
+    let base_selection = self.config.uda_style_report_selection;
+    let style_selected = if base_selection == Style::default() {
+      Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+      base_selection
+    };
+
+    // Collect everything we need from the filtered view before any mutable borrows.
+    let (items, visible_count, detail_text) = {
+      let visible: Vec<&Task> = self.completed_visible_tasks();
+      let count = visible.len();
+      let idx = self.completed_selected.min(count.saturating_sub(1));
+      let detail = if visible.is_empty() {
+        "No completed tasks.".to_string()
+      } else {
+        Self::format_task_details(visible[idx])
+      };
+      let list_items: Vec<ListItem> = visible
+        .iter()
+        .map(|t| {
+          let date_str = t
+            .end()
+            .map(|d| crate::datetime::format_local_date_time(d))
+            .unwrap_or_else(|| "unknown".to_string());
+          let annotation_count = t.annotations().map(|a| a.len()).unwrap_or(0);
+          let badge = if annotation_count > 0 { format!(" [{}]", annotation_count) } else { String::new() };
+          let label = format!("{}{} {}", date_str, badge, t.description());
+          ListItem::new(label).style(style_completed)
+        })
+        .collect();
+      (list_items, count, detail)
+    };
+
+    let title = format!(" Completed ({}) [{}] (f: cycle filter) ", visible_count, self.completed_filter.label());
+    let list = List::new(items)
+      .block(
+        Block::default()
+          .title(title)
+          .borders(Borders::ALL)
+          .border_type(BorderType::Plain),
+      )
+      .highlight_style(style_selected)
+      .highlight_symbol(self.config.uda_selection_indicator.as_str());
+
+    self.completed_list_state.select(if visible_count == 0 {
+      None
+    } else {
+      Some(self.completed_selected.min(visible_count.saturating_sub(1)))
+    });
+    f.render_stateful_widget(list, chunks[0], &mut self.completed_list_state);
+
+    let line_count = detail_text.lines().count() as u16;
+    let max_scroll = line_count.saturating_sub(chunks[1].height);
+    self.completed_detail_scroll = self.completed_detail_scroll.min(max_scroll);
+
+    let detail = Paragraph::new(Text::from(detail_text.as_str()))
+      .block(
+        Block::default()
+          .title(" Details ")
+          .borders(Borders::ALL)
+          .border_type(BorderType::Plain),
+      )
+      .wrap(Wrap { trim: false })
+      .scroll((self.completed_detail_scroll, 0));
+    f.render_widget(detail, chunks[1]);
   }
 
   fn style_for_project(&self, project: &[String]) -> Style {
@@ -972,6 +1148,36 @@ impl TaskwarriorTui {
           self.command.as_str(),
           (
             Span::styled("Add Task", Style::default().add_modifier(Modifier::BOLD)),
+            self
+              .history_status
+              .as_ref()
+              .map(|s| Span::styled(s, Style::default().add_modifier(Modifier::BOLD))),
+          ),
+          position,
+          true,
+          self.error.clone(),
+          ghost.as_deref(),
+        );
+      }
+      Action::AddLinear => {
+        if self.config.uda_auto_insert_double_quotes_on_add && self.command.is_empty() {
+          self.command.update(r#""""#, 1, &mut self.changes);
+        };
+        let position = Self::get_position(&self.command);
+        if self.show_completion_pane {
+          self.draw_completion_pop_up(f, rects[1], position);
+        }
+        let ghost = if !self.show_completion_pane {
+          self.completion_list.ghost_text()
+        } else {
+          None
+        };
+        self.draw_command(
+          f,
+          rects[1],
+          self.command.as_str(),
+          (
+            Span::styled("Add Task + Linear", Style::default().add_modifier(Modifier::BOLD)),
             self
               .history_status
               .as_ref()
@@ -1679,6 +1885,7 @@ impl TaskwarriorTui {
       self.reports.update_data(&self.report, &Self::task_show_output(&self.task_exe)?);
       self.projects.update_data(&self.task_exe)?;
       self.update_timesheet()?;
+      self.update_completed_tasks()?;
       self.update_tags();
       self.task_details.clear();
       self.task_details_modified.clear();
@@ -1759,52 +1966,84 @@ impl TaskwarriorTui {
     }
 
     let mut l = vec![selected];
-
     for s in 1..=self.config.uda_task_detail_prefetch {
       l.insert(0, std::cmp::min(selected.saturating_sub(s), self.tasks.len() - 1));
       l.push(std::cmp::min(selected + s, self.tasks.len() - 1));
     }
-
     l.dedup();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    let tasks = self.tasks.clone();
-    let task_exe = self.task_exe.clone();
-    for s in &l {
-      if tasks.is_empty() {
-        return Ok(());
-      }
-      if s >= &tasks.len() {
+    for s in l {
+      if s >= self.tasks.len() {
         break;
       }
-      let task_uuid = *tasks[*s].uuid();
-      let task_modified = tasks[*s].modified().cloned();
+      let task_uuid = *self.tasks[s].uuid();
+      let task_modified = self.tasks[s].modified().cloned();
       let cached_modified = self.task_details_modified.get(&task_uuid).cloned();
       if !self.task_details.contains_key(&task_uuid) || cached_modified != Some(task_modified.clone()) {
-        debug!("Running task details for {}", task_uuid);
-        let _tx = tx.clone();
-        let task_exe = task_exe.clone();
-        tokio::spawn(async move {
-          let output = tokio::process::Command::new(&task_exe)
-            .arg("rc.color=off")
-            .arg("rc._forcecolor=off")
-            .arg(format!("rc.defaultwidth={}", defaultwidth))
-            .arg(format!("{}", task_uuid))
-            .output()
-            .await;
-          if let Ok(output) = output {
-            let data = String::from_utf8_lossy(&output.stdout).to_string();
-            _tx.send(Some((task_uuid, task_modified, data))).await.unwrap();
-          }
-        });
+        let data = Self::format_task_details(&self.tasks[s]);
+        self.task_details.insert(task_uuid, data);
+        self.task_details_modified.insert(task_uuid, task_modified);
       }
     }
-    drop(tx);
-    while let Some(Some((task_uuid, task_modified, data))) = rx.recv().await {
-      self.task_details.insert(task_uuid, data);
-      self.task_details_modified.insert(task_uuid, task_modified);
-    }
     Ok(())
+  }
+
+  fn format_task_details(task: &Task) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let sep = "─".repeat(60);
+
+    // Description
+    let _ = writeln!(out, " Description");
+    let _ = writeln!(out, " {}", sep);
+    let _ = writeln!(out, " {}", task.description());
+
+    // Linear identifier + URL
+    let uda = task.uda();
+    let identifier = uda
+      .get("linearidentifier")
+      .and_then(|v| if let UDAValue::Str(s) = v { Some(s.as_str()) } else { None })
+      .unwrap_or("");
+    let url = uda
+      .get("linearurl")
+      .and_then(|v| if let UDAValue::Str(s) = v { Some(s.as_str()) } else { None })
+      .unwrap_or("");
+    if !identifier.is_empty() {
+      let _ = writeln!(out, " {} → {}", identifier, url);
+    }
+
+    // Linear description (issue body)
+    let linear_desc = uda
+      .get("lineardescription")
+      .and_then(|v| if let UDAValue::Str(s) = v { Some(s.as_str()) } else { None })
+      .unwrap_or("");
+    if !linear_desc.is_empty() {
+      let _ = writeln!(out);
+      let _ = writeln!(out, " Linear Description");
+      let _ = writeln!(out, " {}", sep);
+      for line in linear_desc.lines() {
+        let _ = writeln!(out, " {}", line);
+      }
+    }
+
+    // Annotations / comments
+    if let Some(annotations) = task.annotations() {
+      if !annotations.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, " Comments ({})", annotations.len());
+        let _ = writeln!(out, " {}", sep);
+        for ann in annotations {
+          let date = crate::datetime::format_local_date_time(&ann.entry());
+          let _ = writeln!(out, " {} │", date);
+          for line in ann.description().lines() {
+            let _ = writeln!(out, "   {}", line);
+          }
+          let _ = writeln!(out);
+        }
+      }
+    }
+
+    out
   }
 
   pub fn update_task_table_state(&mut self) {
@@ -2219,9 +2458,11 @@ impl TaskwarriorTui {
       .arg("rc._forcecolor=off");
     // .arg("rc.verbose:override=false");
 
-    if let Some(args) = shlex::split(format!(r#"rc.report.{}.filter='{}'"#, self.report, self.filter.trim()).trim()) {
-      for arg in args {
-        task.arg(arg);
+    if !self.filter.trim().is_empty() {
+      if let Some(args) = shlex::split(format!(r#"rc.report.{}.filter='{}'"#, self.report, self.filter.trim()).trim()) {
+        for arg in args {
+          task.arg(arg);
+        }
       }
     }
 
@@ -2249,7 +2490,15 @@ impl TaskwarriorTui {
     if output.status.success() {
       let imported = import(data.as_bytes());
       match imported {
-        Ok(imported) => {
+        Ok(mut imported) => {
+          // Always strip completed/deleted tasks from non-archival reports unless
+          // the user's filter explicitly asks for them.
+          let filter_lower = self.filter.trim().to_lowercase();
+          let user_wants_done = filter_lower.contains("status:completed") || filter_lower.contains("status:deleted");
+          let archival_report = matches!(self.report.as_str(), "all" | "completed" | "deleted");
+          if !user_wants_done && !archival_report {
+            imported.retain(|t| !matches!(t.status(), TaskStatus::Completed | TaskStatus::Deleted));
+          }
           self.tasks = imported;
           info!("Imported {} tasks", self.tasks.len());
           self.error = None;
@@ -2582,6 +2831,76 @@ impl TaskwarriorTui {
     }
   }
 
+  pub fn task_add_linear(&mut self) -> Result<(), String> {
+    let mut command = std::process::Command::new(&self.task_exe);
+    command.arg("add");
+
+    let shell = self.command.as_str();
+
+    match shlex::split(shell) {
+      Some(cmd) => {
+        for s in cmd {
+          command.arg(&s);
+        }
+        let output = command.output();
+        match output {
+          Ok(output) => {
+            if output.status.code() == Some(0) {
+              let data = String::from_utf8_lossy(&output.stdout);
+              let re = Regex::new(r"^Created task (?P<task_id>\d+).\n$").unwrap();
+              let task_id = if let Some(caps) = re.captures(&data) {
+                let id = caps["task_id"].parse::<u64>().unwrap_or_default();
+                if self.config.uda_task_report_jump_to_task_on_add {
+                  self.current_selection_id = Some(id);
+                }
+                id
+              } else {
+                return Err(format!("Could not parse task ID from: {}", data));
+              };
+
+              let export_out = std::process::Command::new(&self.task_exe)
+                .arg(task_id.to_string())
+                .arg("export")
+                .output()
+                .map_err(|e| format!("Cannot export task {}: {}", task_id, e))?;
+
+              if !export_out.status.success() {
+                return Err(format!("task export failed: {}", String::from_utf8_lossy(&export_out.stderr)));
+              }
+
+              let export_data = String::from_utf8_lossy(&export_out.stdout);
+              let tasks: Vec<Task> = import(export_data.as_bytes())
+                .map_err(|e| format!("Cannot parse task export: {}", e))?;
+              let task_uuid = *tasks
+                .first()
+                .ok_or_else(|| format!("No task found with ID {}", task_id))?
+                .uuid();
+
+              let linear_out = std::process::Command::new("linear-sync")
+                .arg("push-task")
+                .arg(task_uuid.to_string())
+                .output()
+                .map_err(|e| format!("Cannot run `linear-sync`: {}. Is it installed on PATH?", e))?;
+
+              if !linear_out.status.success() {
+                return Err(format!(
+                  "linear-sync push-task failed: {}",
+                  String::from_utf8_lossy(&linear_out.stderr)
+                ));
+              }
+
+              Ok(())
+            } else {
+              Err(format!("Error: {}", String::from_utf8_lossy(&output.stderr)))
+            }
+          }
+          Err(e) => Err(format!("Cannot run `{:?}`: {}", command, e)),
+        }
+      }
+      None => Err(format!("Unable to run `{:?}`: shlex::split(`{}`) failed.", command, shell)),
+    }
+  }
+
   pub fn task_virtual_tags(task_uuid: Uuid, task_exe: &str) -> Result<String, String> {
     let output = std::process::Command::new(task_exe).arg(format!("{}", task_uuid)).output();
 
@@ -2637,6 +2956,47 @@ impl TaskwarriorTui {
       self.current_selection_uuid = Some(*uuid);
     }
 
+    Ok(())
+  }
+
+  pub fn task_start(&mut self) -> Result<(), String> {
+    if self.tasks.is_empty() {
+      return Ok(());
+    }
+    let task_uuids = self.selected_task_uuids();
+    for task_uuid in &task_uuids {
+      let output = std::process::Command::new(&self.task_exe)
+        .arg(task_uuid.to_string())
+        .arg("start")
+        .output();
+      if output.is_err() {
+        return Err(format!("Error running `task start` for task `{}`.", task_uuid));
+      }
+    }
+    if let [uuid] = task_uuids.as_slice() {
+      self.current_selection_uuid = Some(*uuid);
+    }
+    Ok(())
+  }
+
+  pub fn task_push_linear(&mut self) -> Result<(), String> {
+    if self.tasks.is_empty() {
+      return Ok(());
+    }
+    let task_uuids = self.selected_task_uuids();
+    let task_uuid = match task_uuids.first() {
+      Some(uuid) => *uuid,
+      None => return Ok(()),
+    };
+    let linear_out = std::process::Command::new("linear-sync")
+      .arg("push-task")
+      .arg(task_uuid.to_string())
+      .output()
+      .map_err(|e| format!("Cannot run `linear-sync`: {}. Is it installed on PATH?", e))?;
+    if !linear_out.status.success() {
+      return Err(format!("linear-sync push-task failed: {}", String::from_utf8_lossy(&linear_out.stderr)));
+    }
+    self.current_selection_uuid = Some(task_uuid);
     Ok(())
   }
 
@@ -2872,6 +3232,170 @@ impl TaskwarriorTui {
     r
   }
 
+  async fn edit_linear_uda(&mut self, field: &str) -> Result<(), String> {
+    if self.tasks.is_empty() {
+      return Ok(());
+    }
+    let task_uuid = *self.tasks[self.current_selection].uuid();
+
+    // Export task JSON
+    let export = std::process::Command::new(&self.task_exe)
+      .arg(task_uuid.to_string())
+      .arg("export")
+      .output()
+      .map_err(|e| format!("Cannot export task: {}", e))?;
+    let json_str = String::from_utf8_lossy(&export.stdout);
+    let mut tasks: Vec<serde_json::Value> =
+      serde_json::from_str(&json_str).map_err(|e| format!("Cannot parse task JSON: {}", e))?;
+    let task_obj = tasks.first_mut().ok_or_else(|| format!("No task found for {}", task_uuid))?;
+
+    // Write current field value to a temp file
+    let tmp_path = std::env::temp_dir().join(format!("taskwarrior-linear-{}-{}.md", field, task_uuid));
+    let current = task_obj[field].as_str().unwrap_or("").to_string();
+    std::fs::write(&tmp_path, &current).map_err(|e| format!("Cannot write temp file: {}", e))?;
+
+    // Open editor
+    self.pause_tui().await.unwrap();
+    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+    let status = std::process::Command::new(&editor)
+      .arg(&tmp_path)
+      .spawn()
+      .map_err(|e| format!("Cannot start editor '{}': {}", editor, e))?
+      .wait()
+      .map_err(|e| format!("Editor error: {}", e))?;
+    self.resume_tui().await.unwrap();
+
+    if !status.success() {
+      let _ = std::fs::remove_file(&tmp_path);
+      return Err(format!("Editor exited with error"));
+    }
+
+    let new_value = std::fs::read_to_string(&tmp_path).map_err(|e| format!("Cannot read temp file: {}", e))?;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    // Update field in JSON and import back
+    if let Some(obj) = task_obj.as_object_mut() {
+      if new_value.trim().is_empty() {
+        obj.remove(field);
+      } else {
+        obj.insert(field.to_string(), serde_json::Value::String(new_value.clone()));
+      }
+    }
+    let modified = serde_json::to_string(task_obj).map_err(|e| format!("Cannot serialize task: {}", e))?;
+
+    let mut import_cmd = std::process::Command::new(&self.task_exe)
+      .arg("import")
+      .stdin(std::process::Stdio::piped())
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::piped())
+      .spawn()
+      .map_err(|e| format!("Cannot spawn `task import`: {}", e))?;
+    if let Some(mut stdin) = import_cmd.stdin.take() {
+      use std::io::Write;
+      stdin.write_all(modified.as_bytes()).map_err(|e| format!("Cannot write to task import: {}", e))?;
+    }
+    let out = import_cmd.wait_with_output().map_err(|e| format!("task import failed: {}", e))?;
+    if !out.status.success() {
+      return Err(format!("task import failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+
+    self.current_selection_uuid = Some(task_uuid);
+    Ok(())
+  }
+
+  pub async fn task_edit_linear_description(&mut self) -> Result<(), String> {
+    self.edit_linear_uda("lineardescription").await
+  }
+
+  pub async fn task_edit_linear_comment(&mut self) -> Result<(), String> {
+    if self.tasks.is_empty() {
+      return Ok(());
+    }
+    let task_uuid = *self.tasks[self.current_selection].uuid();
+
+    let export = std::process::Command::new(&self.task_exe)
+      .arg(task_uuid.to_string())
+      .arg("export")
+      .output()
+      .map_err(|e| format!("Cannot export task: {}", e))?;
+    let json_str = String::from_utf8_lossy(&export.stdout);
+    let mut tasks: Vec<serde_json::Value> =
+      serde_json::from_str(&json_str).map_err(|e| format!("Cannot parse task JSON: {}", e))?;
+    let task_obj = tasks.first_mut().ok_or_else(|| format!("No task found for {}", task_uuid))?;
+
+    // Build context from existing annotations so the user can see prior comments
+    let mut content = String::new();
+    if let Some(annotations) = task_obj["annotations"].as_array() {
+      if !annotations.is_empty() {
+        content.push_str("# Previous comments (lines starting with # are ignored):\n");
+        for ann in annotations {
+          let entry = ann["entry"].as_str().unwrap_or("");
+          let desc = ann["description"].as_str().unwrap_or("");
+          content.push_str(&format!("# [{}]\n", entry));
+          for line in desc.lines() {
+            content.push_str(&format!("# {}\n", line));
+          }
+          content.push_str("#\n");
+        }
+        content.push_str("# ---\n\n");
+      }
+    }
+
+    let tmp_path = std::env::temp_dir().join(format!("taskwarrior-linear-linearcomment-{}.md", task_uuid));
+    std::fs::write(&tmp_path, &content).map_err(|e| format!("Cannot write temp file: {}", e))?;
+
+    self.pause_tui().await.unwrap();
+    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+    let status = std::process::Command::new(&editor)
+      .arg(&tmp_path)
+      .spawn()
+      .map_err(|e| format!("Cannot start editor '{}': {}", editor, e))?
+      .wait()
+      .map_err(|e| format!("Editor error: {}", e))?;
+    self.resume_tui().await.unwrap();
+
+    if !status.success() {
+      let _ = std::fs::remove_file(&tmp_path);
+      return Err("Editor exited with error".to_string());
+    }
+
+    let full_content =
+      std::fs::read_to_string(&tmp_path).map_err(|e| format!("Cannot read temp file: {}", e))?;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    // Strip comment lines; only keep the user's new content
+    let new_value: String = full_content.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n");
+
+    if let Some(obj) = task_obj.as_object_mut() {
+      if new_value.trim().is_empty() {
+        obj.remove("linearcomment");
+      } else {
+        obj.insert("linearcomment".to_string(), serde_json::Value::String(new_value.clone()));
+      }
+    }
+    let modified =
+      serde_json::to_string(task_obj).map_err(|e| format!("Cannot serialize task: {}", e))?;
+
+    let mut import_cmd = std::process::Command::new(&self.task_exe)
+      .arg("import")
+      .stdin(std::process::Stdio::piped())
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::piped())
+      .spawn()
+      .map_err(|e| format!("Cannot spawn `task import`: {}", e))?;
+    if let Some(mut stdin) = import_cmd.stdin.take() {
+      use std::io::Write;
+      stdin.write_all(modified.as_bytes()).map_err(|e| format!("Cannot write to task import: {}", e))?;
+    }
+    let out = import_cmd.wait_with_output().map_err(|e| format!("task import failed: {}", e))?;
+    if !out.status.success() {
+      return Err(format!("task import failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+
+    self.current_selection_uuid = Some(task_uuid);
+    Ok(())
+  }
+
   pub fn task_current(&self) -> Option<Task> {
     if self.tasks.is_empty() {
       return None;
@@ -3048,7 +3572,7 @@ impl TaskwarriorTui {
         if input == self.keyconfig.quit || input == KeyCode::Ctrl('c') {
           self.should_quit = true;
         } else if input == self.keyconfig.next_tab {
-          self.mode = Mode::Calendar;
+          self.mode = Mode::Completed;
         } else if input == self.keyconfig.previous_tab {
           self.mode = Mode::Projects;
         } else if input == KeyCode::Up || input == self.keyconfig.up {
@@ -3065,6 +3589,50 @@ impl TaskwarriorTui {
         let max_scroll = self.timesheet_line_count.saturating_sub(viewport);
         self.timesheet_scroll = self.timesheet_scroll.min(max_scroll);
       }
+      Mode::Completed => {
+        if input == self.keyconfig.quit || input == KeyCode::Ctrl('c') {
+          self.should_quit = true;
+        } else if input == self.keyconfig.next_tab {
+          self.mode = Mode::Calendar;
+        } else if input == self.keyconfig.previous_tab {
+          self.mode = Mode::Timesheet;
+        } else if input == KeyCode::Char('f') {
+          self.completed_filter = self.completed_filter.next();
+          self.completed_selected = 0;
+          self.completed_detail_scroll = 0;
+        } else if input == KeyCode::Up || input == self.keyconfig.up {
+          self.completed_selected = self.completed_selected.saturating_sub(1);
+          self.completed_detail_scroll = 0;
+        } else if input == KeyCode::Down || input == self.keyconfig.down {
+          let count = self.completed_visible_tasks().len();
+          if count > 0 {
+            self.completed_selected = (self.completed_selected + 1).min(count - 1);
+          }
+          self.completed_detail_scroll = 0;
+        } else if input == KeyCode::PageUp || input == self.keyconfig.page_up {
+          self.completed_selected = self.completed_selected.saturating_sub(self.terminal_height as usize);
+          self.completed_detail_scroll = 0;
+        } else if input == KeyCode::PageDown || input == self.keyconfig.page_down {
+          let count = self.completed_visible_tasks().len();
+          if count > 0 {
+            self.completed_selected =
+              (self.completed_selected + self.terminal_height as usize).min(count - 1);
+          }
+          self.completed_detail_scroll = 0;
+        } else if input == KeyCode::Ctrl('e') {
+          self.completed_detail_scroll = self.completed_detail_scroll.saturating_add(1);
+        } else if input == KeyCode::Ctrl('y') {
+          self.completed_detail_scroll = self.completed_detail_scroll.saturating_sub(1);
+        } else if input == self.keyconfig.go_to_top || input == KeyCode::Home {
+          self.completed_selected = 0;
+          self.completed_detail_scroll = 0;
+        } else if input == self.keyconfig.go_to_bottom || input == KeyCode::End {
+          self.completed_selected = self.completed_visible_tasks().len().saturating_sub(1);
+          self.completed_detail_scroll = 0;
+        } else if input == self.keyconfig.refresh {
+          self.update_completed_tasks()?;
+        }
+      }
       Mode::Calendar => {
         if input == self.keyconfig.quit || input == KeyCode::Ctrl('c') {
           self.should_quit = true;
@@ -3073,7 +3641,7 @@ impl TaskwarriorTui {
             self.mode = Mode::Tasks(Action::Report);
           }
         } else if input == self.keyconfig.previous_tab {
-          self.mode = Mode::Timesheet;
+          self.mode = Mode::Completed;
         } else if input == KeyCode::Up || input == self.keyconfig.up {
           if self.calendar_year > 0 {
             self.calendar_year -= 1;
@@ -3183,6 +3751,38 @@ impl TaskwarriorTui {
                 self.mode = Mode::Tasks(Action::Error);
               }
             }
+          } else if input == KeyCode::Char('p') {
+            match self.task_start() {
+              Ok(_) => self.update(true).await?,
+              Err(e) => {
+                self.error = Some(e);
+                self.mode = Mode::Tasks(Action::Error);
+              }
+            }
+          } else if input == KeyCode::Ctrl('a') {
+            match self.task_push_linear() {
+              Ok(_) => self.update(true).await?,
+              Err(e) => {
+                self.error = Some(e);
+                self.mode = Mode::Tasks(Action::Error);
+              }
+            }
+          } else if input == KeyCode::Char('D') {
+            match self.task_edit_linear_description().await {
+              Ok(_) => self.update(true).await?,
+              Err(e) => {
+                self.error = Some(e);
+                self.mode = Mode::Tasks(Action::Error);
+              }
+            }
+          } else if input == KeyCode::Char('C') {
+            match self.task_edit_linear_comment().await {
+              Ok(_) => self.update(true).await?,
+              Err(e) => {
+                self.error = Some(e);
+                self.mode = Mode::Tasks(Action::Error);
+              }
+            }
           } else if input == self.keyconfig.quick_tag {
             match self.task_quick_tag() {
               Ok(_) => self.update(true).await?,
@@ -3193,14 +3793,6 @@ impl TaskwarriorTui {
             }
           } else if input == self.keyconfig.edit {
             match self.task_edit().await {
-              Ok(_) => self.update(true).await?,
-              Err(e) => {
-                self.error = Some(e);
-                self.mode = Mode::Tasks(Action::Error);
-              }
-            }
-          } else if input == self.keyconfig.duplicate {
-            match self.task_duplicate() {
               Ok(_) => self.update(true).await?,
               Err(e) => {
                 self.error = Some(e);
@@ -3282,6 +3874,19 @@ impl TaskwarriorTui {
             self.update_completion_list();
           } else if input == self.keyconfig.add {
             self.mode = Mode::Tasks(Action::Add);
+            self.command_history.reset();
+            self.history_status = Some(format!(
+              "{} / {}",
+              self
+                .command_history
+                .history_index()
+                .unwrap_or_else(|| self.command_history.history_len().saturating_sub(1))
+                .saturating_add(1),
+              self.command_history.history_len()
+            ));
+            self.update_completion_list();
+          } else if input == KeyCode::Char('A') {
+            self.mode = Mode::Tasks(Action::AddLinear);
             self.command_history.reset();
             self.history_status = Some(format!(
               "{} / {}",
@@ -4093,6 +4698,114 @@ impl TaskwarriorTui {
             self.update_input_for_completion();
           }
         },
+        Action::AddLinear => match input {
+          KeyCode::Esc => {
+            if self.show_completion_pane {
+              self.show_completion_pane = false;
+              self.completion_list.unselect();
+            } else {
+              self.reset_command();
+              self.history_status = None;
+              self.mode = Mode::Tasks(Action::Report);
+            }
+          }
+          KeyCode::Char('\n') => {
+            if self.show_completion_pane {
+              self.show_completion_pane = false;
+              if let Some((_, (r, _, o, _, _))) = self.completion_list.selected() {
+                Self::apply_completion_to_buffer(&mut self.command, &r, &o, &mut self.changes);
+              }
+              self.completion_list.unselect();
+            } else if self.error.is_some() {
+              self.previous_mode = Some(self.mode.clone());
+              self.mode = Mode::Tasks(Action::Error);
+            } else {
+              match self.task_add_linear() {
+                Ok(_) => {
+                  self.mode = Mode::Tasks(Action::Report);
+                  self.command_history.add(self.command.as_str());
+                  self.reset_command();
+                  self.history_status = None;
+                  self.update(true).await?;
+                }
+                Err(e) => {
+                  self.error = Some(e);
+                  self.mode = Mode::Tasks(Action::Error);
+                }
+              }
+            }
+          }
+          KeyCode::Tab | KeyCode::Ctrl('n') => {
+            if !self.completion_list.is_empty() {
+              self.update_input_for_completion();
+              let candidates = self.completion_list.candidates();
+              if candidates.len() == 1 {
+                let (r, _, o, _, _) = candidates.into_iter().next().unwrap();
+                Self::apply_completion_to_buffer(&mut self.command, &r, &o, &mut self.changes);
+                self.show_completion_pane = false;
+                self.completion_list.unselect();
+                self.update_input_for_completion();
+              } else {
+                if !self.show_completion_pane {
+                  self.show_completion_pane = true;
+                }
+                self.completion_list.next();
+              }
+            }
+          }
+          KeyCode::BackTab | KeyCode::Ctrl('p') => {
+            if self.show_completion_pane && !self.completion_list.is_empty() {
+              self.completion_list.previous();
+            }
+          }
+          KeyCode::Up => {
+            if self.show_completion_pane && !self.completion_list.is_empty() {
+              self.completion_list.previous();
+            } else if let Some(s) = self
+              .command_history
+              .history_search(&self.command.as_str()[..self.command.pos()], HistoryDirection::Reverse)
+            {
+              let p = self.command.pos();
+              self.command.update("", 0, &mut self.changes);
+              self.command.update(&s, std::cmp::min(s.len(), p), &mut self.changes);
+              self.history_status = Some(format!(
+                "{} / {}",
+                self
+                  .command_history
+                  .history_index()
+                  .unwrap_or_else(|| self.command_history.history_len().saturating_sub(1))
+                  .saturating_add(1),
+                self.command_history.history_len()
+              ));
+            }
+          }
+          KeyCode::Down => {
+            if self.show_completion_pane && !self.completion_list.is_empty() {
+              self.completion_list.next();
+            } else if let Some(s) = self
+              .command_history
+              .history_search(&self.command.as_str()[..self.command.pos()], HistoryDirection::Forward)
+            {
+              let p = self.command.pos();
+              self.command.update("", 0, &mut self.changes);
+              self.command.update(&s, std::cmp::min(s.len(), p), &mut self.changes);
+              self.history_status = Some(format!(
+                "{} / {}",
+                self
+                  .command_history
+                  .history_index()
+                  .unwrap_or_else(|| self.command_history.history_len().saturating_sub(1))
+                  .saturating_add(1),
+                self.command_history.history_len()
+              ));
+            }
+          }
+          _ => {
+            self.command_history.reset();
+            handle_movement(&mut self.command, input, &mut self.changes);
+            self.update_input_for_completion();
+          }
+        },
         Action::Filter => match input {
           KeyCode::Esc => {
             if self.show_completion_pane {
@@ -4308,7 +5021,7 @@ impl TaskwarriorTui {
       &self.tasks
     };
 
-    if let Mode::Tasks(Action::Modify | Action::Filter | Action::Annotate | Action::Add | Action::Log) = self.mode {
+    if let Mode::Tasks(Action::Modify | Action::Filter | Action::Annotate | Action::Add | Action::AddLinear | Action::Log) = self.mode {
       for s in [
         "project:".to_string(),
         "priority:".to_string(),
@@ -4323,7 +5036,7 @@ impl TaskwarriorTui {
       }
     }
 
-    if let Mode::Tasks(Action::Modify | Action::Filter | Action::Annotate | Action::Add | Action::Log) = self.mode {
+    if let Mode::Tasks(Action::Modify | Action::Filter | Action::Annotate | Action::Add | Action::AddLinear | Action::Log) = self.mode {
       for s in [
         ".before:",
         ".under:",
@@ -4352,7 +5065,7 @@ impl TaskwarriorTui {
       }
     }
 
-    if let Mode::Tasks(Action::Modify | Action::Filter | Action::Annotate | Action::Add | Action::Log) = self.mode {
+    if let Mode::Tasks(Action::Modify | Action::Filter | Action::Annotate | Action::Add | Action::AddLinear | Action::Log) = self.mode {
       for priority in &self.config.uda_priority_values {
         let p = priority.to_string();
         self.completion_list.insert(("priority".to_string(), p));
@@ -4418,7 +5131,7 @@ impl TaskwarriorTui {
 
   pub fn update_input_for_completion(&mut self) {
     match self.mode {
-      Mode::Tasks(Action::Add | Action::Annotate | Action::Log) => {
+      Mode::Tasks(Action::Add | Action::AddLinear | Action::Annotate | Action::Log) => {
         let i = get_start_word_under_cursor(self.command.as_str(), self.command.pos());
         let input = self.command.as_str()[i..self.command.pos()].to_string();
         self.completion_list.input(input, "".to_string());
